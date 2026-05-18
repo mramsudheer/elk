@@ -1,0 +1,310 @@
+ELK
+Elastic Log stash and Kibana.
+It's developed on Java.
+This is also one Database similar to Prometheus.
+This is basically used for suggestions. It uses 'elastic search'.
+Kibana is an UI component which resides on top of 'Elastic Search'
+Log Stash will push the data into Elastic Search.
+
+We have to push the pods logs which resides on underlying servers to the 'LogStash' using an agent(filebeat) which we need to install 
+an all the servers from where we need the logs. We should configure the 'filebeat' with log path.
+
+
+Logstash will filter the incoming logs. It also converts semi structured data into structured data
+
+
+'LogStash' is an heavy server which requires at least 4 CPU and 8GB.
+
+CREATING LOGSTASH
+================
+t3.xlarge 60Gb disk
+
+sudo growpart /dev/nvme0n1 4
+sudo lvextend -L +20G /dev/RootVG/rootVol
+sudo lvextend -L +20G /dev/RootVG/varVol
+sudo xfs_growfs /
+sudo xfs_growfs /var
+
+# Add the repo
+vim /etc/yum.repos.d/elasticsearch.repo
+[elasticsearch]
+name=Elasticsearch repository for 9.x packages
+baseurl=https://artifacts.elastic.co/packages/9.x/yum
+gpgcheck=1
+gpgkey=https://artifacts.elastic.co/GPG-KEY-elasticsearch
+enabled=1
+type=rpm-md
+
+# Install elasticsearch, kibana, logstash
+dnf install elasticsearch kibana logstash nginx -y
+
+systemctl start elasticsearch
+systemctl start kibana
+
+netstat -nltp
+port:9200 -> Is for Elasticsearch HTTP REST API( main entry point that external applications and users use to communicate with your database )
+and 9300 -> for Other Elasticsearch nodes communication, Java Transport Client
+5601 -> for Kibana
+
+
+# use nginx as reverse proxy for easy web access
+rm -rf /etc/nginx/nginx.conf
+
+vi /etc/nginx/nginx.conf
+user nginx;
+worker_processes auto;
+error_log /var/log/nginx/error.log;
+pid /run/nginx.pid;
+include /usr/share/nginx/modules/*.conf;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    log_format  main  '$remote_addr - $remote_user [$time_local] "$request" '
+                      '$status $body_bytes_sent "$http_referer" '
+                      '"$http_user_agent" "$http_x_forwarded_for" "$request_time" "$upstream_response_time"';
+
+    access_log  /var/log/nginx/access.log  main;
+
+    sendfile            on;
+    tcp_nopush          on;
+    tcp_nodelay         on;
+    keepalive_timeout   65;
+    types_hash_max_size 2048;
+
+    include             /etc/nginx/mime.types;
+    default_type        application/octet-stream;
+
+    include /etc/nginx/conf.d/*.conf;
+  ## Kibana Config
+  upstream kibana {
+    server 127.0.0.1:5601;
+    keepalive 15;
+  }
+
+  server {
+    listen 80;
+
+    location / {
+      proxy_pass http://kibana;
+      proxy_redirect off;
+      proxy_buffering off;
+
+      proxy_http_version 1.1;
+      proxy_set_header Connection "Keep-Alive";
+      proxy_set_header Proxy-Connection "Keep-Alive";
+    }
+
+  }
+}
+
+systemctl restart nginx
+
+
+# Generate an enrollment token for Kibana instance.
+/usr/share/elasticsearch/bin/elasticsearch-create-enrollment-token -s kibana
+
+<publicip> - Place the enrollment token generated abv.-> Click on configure
+It asks for OTP. We can find the OTP in the below path
+
+# Kibana Verification
+/usr/share/kibana/bin/kibana-verification-code
+
+# Reset admin password
+/usr/share/elasticsearch/bin/elasticsearch-reset-password -u elastic
+
+Click on 'Explore On my own'
+
+
+Filebeat
+=====================
+# Create one EC2 for filebeat
+
+# Install any application to get the logs, I am installing nginx here
+
+dnf install nginx -y
+
+Follow 'FrontEnd' roboshop documentations
+systemctl start nginx
+<access public_ip>
+
+tail -f /var/log/nginx/access.log
+
+# Add the repo
+
+vim /etc/yum.repos.d/elasticsearch.repo
+[elasticsearch]
+name=Elasticsearch repository for 9.x packages
+baseurl=https://artifacts.elastic.co/packages/9.x/yum
+gpgcheck=1
+gpgkey=https://artifacts.elastic.co/GPG-KEY-elasticsearch
+enabled=1
+type=rpm-md
+
+dnf install filebeat -y
+
+# Let's push nginx logs to elasticsearch. Edit the filebeat config(we are gonna to inform filebeat to take the logs from the given path.
+
+vim /etc/filebeat/filebeat.yml
+enabled: true
+paths: - var/log/nginx/access.log
+output.elasticsearch: hosts: ["<Prev.server_PrivateIP>:9200"]
+#inputs: nginx access log
+#outputs: elastic
+ssl.verification_mode: none
+protocol: https(enable)
+username: "elastic"
+password:"<give the p/w used in step # Reset admin password>"
+
+systemctl restart filebeat
+journalctl -u filebeat -f
+
+<access main server <public_ip>
+# Go to stack management and see the data in index management -> Data Steams -> filebeat-9.4.1
+# Create an index
+Create 'Data view' from leftside menu
+	Name: filebeat
+	index pattern: filebeat-*(this will pull all the logs which are cmg with 'filebeat-')
+	And click on 'Save data view to kibana'
+# On the main screen left menu click on 'Ingest pipelines'(To see the logs stored in 'Elastic Search'
+Here we can use Kibana Query Language to the required data.
+# Log format is configured in the nginx (/etc/nginx/nginx.conf)
+grokdebugger.com
+
+# Now we can see logs in discover
+
+Logstash (in main server)
+==============
+systemctl start logstash
+logstash configuration
+
+vim /etc/logstash/conf.d/nginx-access-log.conf (Change password with yours)
+input {
+  beats {
+    port => 5044
+    host => "0.0.0.0"
+  }
+}
+
+filter {
+  grok {
+    match => {
+      "message" => '%{IPORHOST:client_ip} - %{DATA:remote_user} \[%{HTTPDATE:time_local}\] \"%{WORD:method} %{URIPATHPARAM:request} HTTP/%{NUMBER:http_version}\" %{NUMBER:status} %{NUMBER:body_bytes_sent} \"%{DATA:http_referer}\" \"%{DATA:http_user_agent}\" \"%{DATA:http_x_forwarded_for}\" %{NUMBER:request_time} %{DATA:upstream_response_time}'
+    }
+  }
+
+  date {
+    match => ["time_local", "dd/MMM/yyyy:HH:mm:ss Z"]
+    target => "@timestamp"
+    remove_field => ["time_local"]
+  }
+
+  mutate {
+    convert => {
+      "status"          => "integer"
+      "body_bytes_sent" => "integer"
+      "request_time"    => "float"
+      "http_version"    => "float"
+    }
+  }
+
+  # Handle upstream_response_time being "-" or a number
+  if [upstream_response_time] != "-" {
+    mutate {
+      convert => { "upstream_response_time" => "float" }
+    }
+  }
+
+  if [request_time] and [request_time] > 1 {
+    mutate {
+      add_tag => ["slow_request"]
+    }
+  }
+}
+
+output {
+  elasticsearch {
+    hosts    => ["https://localhost:9200"]
+    index    => "nginx-logs-%{+yyyy.MM.dd}"
+    user     => "elastic"
+    password => "S=0MyJP5YPd1AynF6EaE"
+    ssl_verification_mode => "none"
+  }
+}
+
+systemctl restart logstash
+systemctl status logstash
+
+# In the below path, we can place all the log files configuration path.
+cd /etc/logsash/conf.d
+vi nginx.conf (Copy /etc/logstash/conf.d/nginx-access-log.conf (Change password with yours))
+
+systemctl restart logstash
+systemctl status logstash
+journalctl -u logstash -f
+
+less /var/log/logstash/logstast-plan.log
+
+# To tesh the configurations
+sudo -u logstash /usr/share/logstash/bin/logstash --config.test_and_exit -f /etc/logstash/conf.d/nginx.conf
+chown -R logstash:logstash /usr/share/logstash/data
+chown -R logstash:logstash /etc/logstash
+chown -R logstash:logstash /var/log/logstash
+
+cd /etc/logstash
+cat logstash.yaml
+cd /etc/logstash/conf.d
+mv nginx.conf nginx-access.conf
+systemctl restart logstash
+pkill -9  -f logstash
+sleep 3
+ps aux | grep logstash | grep -v grep
+rm -rf /usr/share/logstash/data/queue/*
+rm -rf /usr/share/logstash/data/dead_letter_queue/*
+chown -R logstash:logstash /usr/share/logstash/data
+ls -la /etc/logstash/conf.d/
+systectl start logstash
+journelctl -u logstash -f
+
+
+netstat -nltp
+
+# In second server
+/usr/share/nginx/html
+cat /etc/nginx/nginx.conf
+Append the below to log_format if not present
+ "$request_time" "$upstream_response_time"
+
+# Edit filebeat config to send logs to logstash(In second server)
+vi /etc/filebeat/filebeat.yaml
+output.elasticsearch:
+	enabled:false
+output.logstach:
+	hosts: ["primary server privateip:5044"]
+
+systemctl restart filebeat
+journerctl -u filebeat -f
+
+# Check in main server url
+Stach management -> Index Management
+Create Data view from left menu Kabina
+	Name: nginx-logs
+	Index pattern: nginx-logs-*
+Now in main screen left menu, 'Ingest Pipeline' -> data view -> nginx-logs
+Now in left menu create 'visualization' x-axis=@timestamp y-axis=count status advance status>399
+save new dashboard 'roboshop'
+
+Now When we try to access frontend url, filebeat will take the logs sends to the input logstash. 
+Logstash will filter those logs and convert those into key/value pair and sends to the ElasticSearch.
+And in Kibana, we created the visualization, there we can see the automatic refreshing data.
+
+
+Create index again, and see the logs are converted to structured
+
+Sending EKS logs to ELK
+==========================
+helm repo add elastic https://helm.elastic.co
+helm install filebeat elastic/filebeat -f filebeat.yml
+Change logstash config to receive EKS container logs. Final logstash config is
